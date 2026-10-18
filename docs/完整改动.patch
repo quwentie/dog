@@ -1,0 +1,1472 @@
+--- a/HardWare/BlueTooth.c
++++ b/HardWare/BlueTooth.c
+@@ -1,21 +1,41 @@
+-#include "stm32f10x.h"                  // Device header
+-#include "PWM.h"
++#include "stm32f10x.h"
++#include "BlueTooth.h"
++#include "Servo.h"
+ #include "PetAction.h"
+ #include "Face_Config.h"
+ 
+-uint16_t AllLed=1;  //开启灯光
+-uint16_t BreatheLed=0;//开启呼吸灯
+-uint16_t Sustainedmove=0;//持续运动
+-
+-
+-uint16_t Action_Mode=0;
+-uint16_t SpeedDelay=200;
+-uint16_t SwingDelay=6;
+-uint16_t Face_Mode=0;
+-uint8_t WeiBa=0;
++volatile uint16_t AllLed = 1;
++volatile uint16_t BreatheLed = 0;
++volatile uint16_t Sustainedmove = 0;
++volatile uint16_t Action_Mode = 0;
++volatile uint16_t SpeedDelay = 200;
++volatile uint16_t SwingDelay = 6;
++volatile uint16_t Face_Mode = 0;
++volatile uint8_t WeiBa = 0;
++volatile uint32_t Action_RequestId = 0;
++volatile uint32_t Serial_RxOverflow = 0;
++volatile uint32_t Voice_RxErrors = 0;
++volatile uint32_t BlueTooth_RxErrors = 0;
++
++/* Two interrupt producers, one foreground consumer. Capacity: 63 events. */
++#define RX_QUEUE_SIZE 64
++#define RX_QUEUE_MASK (RX_QUEUE_SIZE - 1)
++typedef struct {
++    uint8_t data;
++    uint8_t continuous;
++} RxEvent;
++static volatile RxEvent RxQueue[RX_QUEUE_SIZE];
++static volatile uint8_t RxHead;
++static volatile uint8_t RxTail;
++static uint16_t DisplayedFace = 0xFFFF;
++static uint8_t TailCenterPending;
+ 
+ void BlueTooth_Init(void)
+ {
++	RxHead = RxTail = 0;
++	Serial_RxOverflow = Voice_RxErrors = BlueTooth_RxErrors = 0;
++	DisplayedFace = 0xFFFF;
++	TailCenterPending = 0;
+ 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA,ENABLE);//开启GPIOA时钟
+ 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1,ENABLE);//开启串口时钟
+ 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB,ENABLE);//开启GPIOB时钟
+@@ -39,7 +59,7 @@
+ 	GPIO_InitStructure.GPIO_Pin=GPIO_Pin_11;//默认PB11是USART3_RX的复用
+ 	GPIO_InitStructure.GPIO_Speed=GPIO_Speed_50MHz;
+ 	GPIO_Init(GPIOB,&GPIO_InitStructure);
+-	
++
+ 	USART_InitTypeDef UASRT_InitStructure;//USART初始化
+ 	UASRT_InitStructure.USART_BaudRate=9600;//波特率9600
+ 	UASRT_InitStructure.USART_HardwareFlowControl=USART_HardwareFlowControl_None;//不需要硬件流控制
+@@ -49,10 +69,10 @@
+ 	UASRT_InitStructure.USART_WordLength=USART_WordLength_8b;//字长8位
+ 	USART_Init(USART1,&UASRT_InitStructure);
+ 	USART_Init(USART3,&UASRT_InitStructure);
+-	
++
+ 	USART_ITConfig(USART1,USART_IT_RXNE,ENABLE);//语音接收中断配置，也就是如果接送到消息就直接中断
+ 	USART_ITConfig(USART3,USART_IT_RXNE,ENABLE);//蓝牙接收中断配置，也就是如果接送到消息就直接中断
+-	
++
+ 	//中断
+ 	NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);//分组2
+ 	//语音中断配置
+@@ -68,303 +88,139 @@
+ 	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=2;//抢占式优先级为2
+ 	NVIC_InitStructure.NVIC_IRQChannelSubPriority=1;//响应优先级为1
+ 	NVIC_Init(&NVIC_InitStructure);
+-	
++
+ 	USART_Cmd(USART1,ENABLE);//USART1使能打开
+ 	USART_Cmd(USART3,ENABLE);//USART3使能打开
+ }
+ 
++/* Preserve PRIMASK: USART1 can preempt USART3 while enqueueing. */
++static void ReceiveEvent(uint8_t data, uint8_t continuous)
++{
++    uint32_t mask = __get_PRIMASK();
++    uint8_t next;
++    __disable_irq();
++    next = (uint8_t)((RxHead + 1) & RX_QUEUE_MASK);
++    if (next == RxTail) {
++        Serial_RxOverflow++;
++    } else {
++        RxQueue[RxHead].data = data;
++        RxQueue[RxHead].continuous = continuous;
++        RxHead = next;
++    }
++    __set_PRIMASK(mask);
++}
++
++static void ReceiveInterrupt(USART_TypeDef *port, uint8_t continuous)
++{
++    /* SR then one DR read clears RXNE and receive errors on STM32F1. */
++    uint32_t status = port->SR;
++    uint16_t data;
++    const uint32_t errors = USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE;
++    if ((status & (USART_SR_RXNE | errors)) == 0) {
++        return;
++    }
++    data = USART_ReceiveData(port);
++    if ((status & errors) != 0) {
++        if (continuous) {
++            BlueTooth_RxErrors++;
++        } else {
++            Voice_RxErrors++;
++        }
++        return; /* Discard ambiguous/error-marked data; next byte can recover. */
++    }
++    if ((status & USART_SR_RXNE) != 0) {
++        ReceiveEvent((uint8_t)data, continuous);
++    }
++}
++
+ void USART1_IRQHandler(void)
+ {
+-	if(USART_GetITStatus(USART1,USART_IT_RXNE)==SET)//如果接受到
+-	{
+-		Sustainedmove=0;//持续运动关闭
+-		
+-		if(USART_ReceiveData(USART1)==0x29)//放松的趴下
+-		{
+-			Face_Mode=0;
+-			Face_Config();
+-			Action_Mode=0;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x30)//蹲下
+-		{
+-			Face_Mode=1;
+-			Face_Config();
+-			Action_Mode=1;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x31)//直立
+-		{
+-			Face_Mode=5;
+-			Face_Config();
+-			Action_Mode=2;
+-
+-		}
+-		else if(USART_ReceiveData(USART1)==0x32)//趴下
+-		{
+-			Face_Mode=1;
+-			Face_Config();
+-			Action_Mode=3;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x33)//前进
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=4;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x34)//后退
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=5;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x35)//左转
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=6;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x36)//右转
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=7;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x37)//摇摆
+-		{
+-			Face_Mode=4;
+-			Face_Config();
+-			Action_Mode=8;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x38)//减少移动延迟，增加移动速度
+-		{
+-			if(SpeedDelay==120){Face_Mode=3;Face_Config();}
+-			if(SpeedDelay>100)
+-			SpeedDelay-=20;	
+-			else
+-			{
+-				Face_Mode=2;
+-				Face_Config();
+-				SpeedDelay=200;
+-			}
+-
+-				
+-		}
+-		else if(USART_ReceiveData(USART1)==0x39)//减少摇摆延迟，增加摇摆速度
+-		{
+-			if(SwingDelay==4){Face_Mode=3;Face_Config();}
+-			if(SwingDelay>3)
+-			SwingDelay--;	
+-			else
+-			{	
+-				Face_Mode=4;
+-				Face_Config();
+-				SwingDelay=9;
+-			}
+-		}
+-		
+-		else if(USART_ReceiveData(USART1)==0x40)//摇尾巴
+-		{
+-			(WeiBa==0)?(WeiBa=1):(WeiBa=0);
+-			Face_Mode=1;
+-			Face_Config();
+-			Action_Mode=9;
+-		}
+-		
+-		else if(USART_ReceiveData(USART1)==0x41)//向前跳
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=10;
+-		}
+-		
+-		else if(USART_ReceiveData(USART1)==0x42)//向后跳
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=11;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x43)//打招呼
+-		{
+-			Face_Mode=6;
+-			Face_Config();
+-			Action_Mode=13;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x44)//开启灯光
+-		{
+-			AllLed=1;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x45)//关闭灯光
+-		{
+-			AllLed=0;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x46)//开启呼吸灯
+-		{
+-			BreatheLed=1;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x47)//关闭呼吸灯
+-		{
+-			BreatheLed=0;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x48)//伸懒腰
+-		{
+-			Face_Mode=6;
+-			Face_Config();
+-			Action_Mode=14;
+-		}
+-		else if(USART_ReceiveData(USART1)==0x49)//伸懒腰
+-		{
+-			Face_Mode=6;
+-			Face_Config();
+-			Action_Mode=15;
+-		}
+-		USART_ClearITPendingBit(USART1,USART_IT_RXNE);
+-	}
+-	
++    ReceiveInterrupt(USART1, 0);
+ }
+ 
+ void USART3_IRQHandler(void)
+ {
+-	if(USART_GetITStatus(USART3,USART_IT_RXNE)==SET)//如果接受到
+-	{
+-		Sustainedmove=1;//持续运动开启
+-		
+-		if(USART_ReceiveData(USART3)==0x29)//放松的趴下
+-		{
+-			Face_Mode=0;
+-			Face_Config();
+-			Action_Mode=0;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x30)//蹲下
+-		{
+-			Face_Mode=1;
+-			Face_Config();
+-			Action_Mode=1;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x31)//直立
+-		{
+-			Face_Mode=5;
+-			Face_Config();
+-			Action_Mode=2;
+-
+-		}
+-		else if(USART_ReceiveData(USART3)==0x32)//趴下
+-		{
+-			Face_Mode=1;
+-			Face_Config();
+-			Action_Mode=3;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x33)//前进
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=4;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x34)//后退
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=5;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x35)//左转
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=6;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x36)//右转
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=7;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x37)//摇摆
+-		{
+-			Face_Mode=4;
+-			Face_Config();
+-			Action_Mode=8;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x38)//减少移动延迟，增加移动速度
+-		{
+-			if(SpeedDelay==120){Face_Mode=3;Face_Config();}
+-			if(SpeedDelay>100)
+-			SpeedDelay-=20;	
+-			else
+-			{
+-				Face_Mode=2;
+-				Face_Config();
+-				SpeedDelay=200;
+-			}
+-
+-				
+-		}
+-		else if(USART_ReceiveData(USART3)==0x39)//减少摇摆延迟，增加摇摆速度
+-		{
+-			if(SwingDelay==4){Face_Mode=3;Face_Config();}
+-			if(SwingDelay>3)
+-			SwingDelay--;	
+-			else
+-			{	
+-				Face_Mode=4;
+-				Face_Config();
+-				SwingDelay=9;
+-			}
+-		}
+-		
+-		else if(USART_ReceiveData(USART3)==0x40)//摇尾巴
+-		{
+-			(WeiBa==0)?(WeiBa=1):(WeiBa=0);
+-			Face_Mode=1;
+-			Face_Config();
+-			Action_Mode=9;
+-		}
+-		
+-		else if(USART_ReceiveData(USART3)==0x41)//向前跳
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=10;
+-		}
+-		
+-		else if(USART_ReceiveData(USART3)==0x42)//向后跳
+-		{
+-			Face_Mode=2;
+-			Face_Config();
+-			Action_Mode=11;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x43)//打招呼
+-		{
+-			Face_Mode=6;
+-			Face_Config();
+-			Action_Mode=13;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x44)//开启灯光
+-		{
+-			AllLed=1;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x45)//关闭灯光
+-		{
+-			AllLed=0;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x46)//开启呼吸灯
+-		{
+-			BreatheLed=1;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x47)//关闭呼吸灯
+-		{
+-			BreatheLed=0;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x48)//伸懒腰
+-		{
+-			Face_Mode=6;
+-			Face_Config();
+-			Action_Mode=14;
+-		}
+-		else if(USART_ReceiveData(USART3)==0x49)//拉伸腿
+-		{
+-			Face_Mode=6;
+-			Face_Config();
+-			Action_Mode=15;
+-		}
+-		
+-		USART_ClearITPendingBit(USART3,USART_IT_RXNE);
+-	}
+-}
++    ReceiveInterrupt(USART3, 1);
++}
++
++static void SelectAction(uint16_t mode, uint16_t face, uint8_t continuous)
++{
++    if (Action_Mode == ACTION_MODE_AFFECTION && mode != ACTION_MODE_AFFECTION) {
++        TailCenterPending = 1;
++    }
++    Sustainedmove = continuous;
++    Face_Mode = face;
++    Action_Mode = mode;
++    /* Same-mode requests also cancel and restart the old action. */
++    Action_RequestId++;
++}
++
++/* Foreground only: ancillary/unknown bytes must not change movement policy. */
++static void ProcessCommand(uint8_t data, uint8_t continuous)
++{
++    switch (data) {
++    case 0x29: SelectAction(0, 0, continuous); break;
++    case 0x30: SelectAction(1, 1, continuous); break;
++    case 0x31: SelectAction(2, 5, continuous); break;
++    case 0x32: SelectAction(3, 1, continuous); break;
++    case 0x33: SelectAction(4, 2, continuous); break;
++    case 0x34: SelectAction(5, 2, continuous); break;
++    case 0x35: SelectAction(6, 2, continuous); break;
++    case 0x36: SelectAction(7, 2, continuous); break;
++    case 0x37: SelectAction(8, 4, continuous); break;
++    case 0x38:
++        if (SpeedDelay == 120) { Face_Mode = 3; }
++        if (SpeedDelay > 100) { SpeedDelay -= 20; }
++        else { SpeedDelay = 200; Face_Mode = 2; }
++        break;
++    case 0x39:
++        if (SwingDelay == 4) { Face_Mode = 3; }
++        if (SwingDelay > 3) { SwingDelay--; }
++        else { SwingDelay = 9; Face_Mode = 4; }
++        break;
++    case 0x40:
++        WeiBa = (uint8_t)!WeiBa;
++        if (WeiBa) {
++            SelectAction(9, 1, continuous);
++        } else {
++            TailCenterPending = 1;
++            Face_Mode = 1;
++            if (Action_Mode == 9 || Action_Mode == ACTION_MODE_AFFECTION) {
++                SelectAction(2, 1, continuous);
++            }
++        }
++        break;
++    case 0x41: SelectAction(10, 2, continuous); break;
++    case 0x42: SelectAction(11, 2, continuous); break;
++    case 0x43: SelectAction(13, 6, continuous); break;
++    case 0x44: AllLed = 1; break;
++    case 0x45: AllLed = 0; break;
++    case 0x46: BreatheLed = 1; break;
++    case 0x47: BreatheLed = 0; break;
++    case 0x48: SelectAction(14, 6, continuous); break;
++    case 0x49: SelectAction(15, 6, continuous); break;
++    case 0x50: SelectAction(ACTION_MODE_AFFECTION, 1, continuous); break;
++    default: break;
++    }
++}
++
++void BlueTooth_Process(void)
++{
++    /* Bound each batch so a continuous stream cannot starve the actions. */
++    uint8_t end = RxHead;
++    while (RxTail != end) {
++        uint8_t data = RxQueue[RxTail].data;
++        uint8_t continuous = RxQueue[RxTail].continuous;
++        RxTail = (uint8_t)((RxTail + 1) & RX_QUEUE_MASK);
++        ProcessCommand(data, continuous);
++    }
++    if (TailCenterPending) {
++        TailCenterPending = 0;
++        WServo_Angle(90);
++    }
++    /* All OLED access stays in foreground, including during action waits. */
++    if (DisplayedFace != Face_Mode) {
++        Face_Config();
++        DisplayedFace = Face_Mode;
++    }
++}
+--- a/HardWare/BlueTooth.h
++++ b/HardWare/BlueTooth.h
+@@ -1,15 +1,24 @@
+ #ifndef __BLUE_TOOTH_H
+ #define __BLUE_TOOTH_H
+ 
+-extern uint16_t Action_Mode;
+-extern uint16_t Face_Mode;
+-extern uint16_t SpeedDelay;
+-extern uint16_t SwingDelay;
+-extern uint8_t WeiBa;
+-extern uint16_t AllLed;  //开启灯光
+-extern uint16_t BreatheLed;//开启呼吸灯
+-extern uint16_t Sustainedmove;
++#include <stdint.h>
++
++extern volatile uint16_t Action_Mode;
++extern volatile uint16_t Face_Mode;
++extern volatile uint16_t SpeedDelay;
++extern volatile uint16_t SwingDelay;
++extern volatile uint8_t WeiBa;
++extern volatile uint16_t AllLed;
++extern volatile uint16_t BreatheLed;
++extern volatile uint16_t Sustainedmove;
++extern volatile uint32_t Action_RequestId;
++/* Diagnostics: dropped queue events and error-marked USART receives. */
++extern volatile uint32_t Serial_RxOverflow;
++extern volatile uint32_t Voice_RxErrors;
++extern volatile uint32_t BlueTooth_RxErrors;
+ 
+ void BlueTooth_Init(void);
++/* Call from foreground only, regularly during long-running actions. */
++void BlueTooth_Process(void);
+ 
+ #endif
+--- a/HardWare/PetAction.c
++++ b/HardWare/PetAction.c
+@@ -2,16 +2,17 @@
+ #include "Servo.h"
+ #include "Delay.h"
+ #include "BlueTooth.h"
++#include "PetAction.h"
+ 
+ 	/*舵机位置
+ 	    1        2
+-	
+-	
+-
+-	
++
++
++
++
+ 	    3        4
+ 	*/
+-	
++
+ 	//舵机充当腿，括号里的值为0时表示的是腿向前进的方向甩，90度是站立
+ 
+ #define Chongfunumber 2  //动作重复次数
+@@ -23,23 +24,50 @@
+ 
+ 
+ 
++/* Commands are applied only here/main, never by an ISR. Checking a request
++ * after every millisecond also handles repeated requests for the same mode.
++ * OLED transfers may add latency; this is not a nonblocking action scheduler.
++ */
++static uint8_t Action_IsCurrent(uint16_t mode, uint32_t request)
++{
++    return Action_Mode == mode && Action_RequestId == request
++        && (mode != 9 || WeiBa != 0);
++}
++
++static uint8_t Action_Wait(uint16_t mode, uint32_t request, uint32_t ms)
++{
++    BlueTooth_Process();
++    if (!Action_IsCurrent(mode, request)) { return 0; }
++    while (ms--) {
++        Delay_ms(1);
++        BlueTooth_Process();
++        if (!Action_IsCurrent(mode, request)) { return 0; }
++    }
++    return 1;
++}
++
+ void Action_relaxed_getdowm(void)
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(0, request, 0)) { return; }
+ 	Servo_Angle1(20);
+ 	Servo_Angle2(20);
+-	Delay_ms(80);
++	if (!Action_Wait(0, request, 80)) { return; }
+ 	Servo_Angle3(160);
+ 	Servo_Angle4(160);
++	WServo_Angle(90);
+ }
+ 
+ void Action_upright(void)//站立
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(2, request, 0)) { return; }
+ 	Servo_Angle1(90);
+ 	Servo_Angle2(90);
+-	Delay_ms(80);
++	if (!Action_Wait(2, request, 80)) { return; }
+ 	Servo_Angle3(90);
+ 	Servo_Angle4(90);
+-	
++
+ 	if(WeiBa==1)
+ 	{
+ 		Action_Mode=9;
+@@ -48,12 +76,14 @@
+ 
+ void Action_upright2(void)//站立
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(12, request, 0)) { return; }
+ 	Servo_Angle3(90);
+ 	Servo_Angle4(90);
+-	Delay_ms(80);
++	if (!Action_Wait(12, request, 80)) { return; }
+ 	Servo_Angle1(90);
+ 	Servo_Angle2(90);
+-	
++
+ 	if(WeiBa==1)
+ 	{
+ 		Action_Mode=9;
+@@ -62,12 +92,14 @@
+ 
+ void Action_getdowm(void)//趴下
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(3, request, 0)) { return; }
+ 	Servo_Angle1(20);
+ 	Servo_Angle2(20);
+-	Delay_ms(80);
++	if (!Action_Wait(3, request, 80)) { return; }
+ 	Servo_Angle3(20);
+ 	Servo_Angle4(20);
+-	
++
+ 	if(WeiBa==1)
+ 	{
+ 		Action_Mode=9;
+@@ -76,12 +108,14 @@
+ 
+ void Action_sit(void)//坐下
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(1, request, 0)) { return; }
+ 	Servo_Angle1(90);
+ 	Servo_Angle2(90);
+-	Delay_ms(80);
++	if (!Action_Wait(1, request, 80)) { return; }
+ 	Servo_Angle3(20);
+ 	Servo_Angle4(20);
+-	
++
+ 	if(WeiBa==1)
+ 	{
+ 		Action_Mode=9;
+@@ -92,47 +126,49 @@
+ 
+ void Action_advance(void)//前进
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(4, request, 0)) { return; }
+ 
+ 	while(Action_Mode==4)
+ 	{
+ 		PAnumbers=Chongfunumber;
+ 			while((PAnumbers || Sustainedmove)&& Action_Mode==4)
+ 			{
+-				Servo_Angle2(45);	
++				Servo_Angle2(45);
+ 				Servo_Angle3(45);
+-				Delay_ms(SpeedDelay);
+-				if(Action_Mode!=4)break;
+-				Servo_Angle1(135);	
++				if (!Action_Wait(4, request, SpeedDelay)) { return; }
++
++				Servo_Angle1(135);
+ 				Servo_Angle4(135);
+-				Delay_ms(SpeedDelay);
+-				if(Action_Mode!=4)break;
+-				Servo_Angle2(90);	
++				if (!Action_Wait(4, request, SpeedDelay)) { return; }
++
++				Servo_Angle2(90);
+ 				Servo_Angle3(90);
+-				Delay_ms(SpeedDelay);
+-				if(Action_Mode!=4)break;
+-				Servo_Angle1(90);	
++				if (!Action_Wait(4, request, SpeedDelay)) { return; }
++
++				Servo_Angle1(90);
+ 				Servo_Angle4(90);
+-				Delay_ms(SpeedDelay);
+-				if(Action_Mode!=4)break;
+-		
+-				Servo_Angle1(45);	
++				if (!Action_Wait(4, request, SpeedDelay)) { return; }
++
++
++				Servo_Angle1(45);
+ 				Servo_Angle4(45);
+-				Delay_ms(SpeedDelay);
+-				if(Action_Mode!=4)break;
+-				Servo_Angle2(135);	
++				if (!Action_Wait(4, request, SpeedDelay)) { return; }
++
++				Servo_Angle2(135);
+ 				Servo_Angle3(135);
+-				Delay_ms(SpeedDelay);
+-				if(Action_Mode!=4)break;
+-				Servo_Angle1(90);	
++				if (!Action_Wait(4, request, SpeedDelay)) { return; }
++
++				Servo_Angle1(90);
+ 				Servo_Angle4(90);
+-				Delay_ms(SpeedDelay);
+-				if(Action_Mode!=4)break;
+-				Servo_Angle2(90);	
++				if (!Action_Wait(4, request, SpeedDelay)) { return; }
++
++				Servo_Angle2(90);
+ 				Servo_Angle3(90);
+-				Delay_ms(SpeedDelay);
+-				if(Action_Mode!=4)break;
+-				
+-				PAnumbers--;
++				if (!Action_Wait(4, request, SpeedDelay)) { return; }
++
++
++				if (PAnumbers > 0) { PAnumbers--; }
+ 			}
+ 			if(Sustainedmove!=1 && Action_Mode==4)
+ 				Action_Mode=2;
+@@ -141,56 +177,60 @@
+ 
+ void Action_back(void)//后退
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(5, request, 0)) { return; }
+ 	while(Action_Mode==5)
+ 	{
+ 		PAnumbers=Chongfunumber;
+ 		while((PAnumbers || Sustainedmove) && Action_Mode==5 )
+ 		{
+-			Servo_Angle2(135);	
++			Servo_Angle2(135);
+ 			Servo_Angle3(135);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=5)break;
+-			Servo_Angle1(45);	
++			if (!Action_Wait(5, request, SpeedDelay)) { return; }
++
++			Servo_Angle1(45);
+ 			Servo_Angle4(45);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=5)break;
+-			Servo_Angle2(90);	
++			if (!Action_Wait(5, request, SpeedDelay)) { return; }
++
++			Servo_Angle2(90);
+ 			Servo_Angle3(90);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=5)break;
+-			Servo_Angle1(90);	
++			if (!Action_Wait(5, request, SpeedDelay)) { return; }
++
++			Servo_Angle1(90);
+ 			Servo_Angle4(90);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=5)break;
+-			
+-			Servo_Angle1(135);	
++			if (!Action_Wait(5, request, SpeedDelay)) { return; }
++
++
++			Servo_Angle1(135);
+ 			Servo_Angle4(135);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=5)break;
+-			Servo_Angle2(45);	
++			if (!Action_Wait(5, request, SpeedDelay)) { return; }
++
++			Servo_Angle2(45);
+ 			Servo_Angle3(45);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=5)break;
+-			Servo_Angle1(90);	
++			if (!Action_Wait(5, request, SpeedDelay)) { return; }
++
++			Servo_Angle1(90);
+ 			Servo_Angle4(90);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=5)break;
+-			Servo_Angle2(90);	
++			if (!Action_Wait(5, request, SpeedDelay)) { return; }
++
++			Servo_Angle2(90);
+ 			Servo_Angle3(90);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=5)break;
+-			
+-			PAnumbers--;
++			if (!Action_Wait(5, request, SpeedDelay)) { return; }
++
++
++			if (PAnumbers > 0) { PAnumbers--; }
+ 		}
+ 		if(Sustainedmove!=1 && Action_Mode==5)
+ 		Action_Mode=2;
+ 
+-		
++
+ 	}
+ }
+ 
+ void Action_Lrotation(void)//向左旋转
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(6, request, 0)) { return; }
+ 	while(Action_Mode==6)
+ 	{
+ 		PAnumbers=Chongfunumber;
+@@ -199,22 +239,22 @@
+ 		{
+ 			Servo_Angle2(45);
+ 			Servo_Angle3(135);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=6)break;
++			if (!Action_Wait(6, request, SpeedDelay)) { return; }
++
+ 			Servo_Angle1(45);
+ 			Servo_Angle4(135);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=6)break;
++			if (!Action_Wait(6, request, SpeedDelay)) { return; }
++
+ 			Servo_Angle2(90);
+-			Servo_Angle3(90);	
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=6)break;
++			Servo_Angle3(90);
++			if (!Action_Wait(6, request, SpeedDelay)) { return; }
++
+ 			Servo_Angle1(90);
+-			Servo_Angle4(90);	
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=6)break;
+-			
+-			PAnumbers--;
++			Servo_Angle4(90);
++			if (!Action_Wait(6, request, SpeedDelay)) { return; }
++
++
++			if (PAnumbers > 0) { PAnumbers--; }
+ 		}
+ 		if(Sustainedmove!=1 && Action_Mode==6)
+ 		Action_Mode=2;
+@@ -225,6 +265,8 @@
+ 
+ void Action_Rrotation(void)//向右旋转
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(7, request, 0)) { return; }
+ 	while(Action_Mode==7)
+ 	{
+ 		PAnumbers=Chongfunumber;
+@@ -233,22 +275,22 @@
+ 		{
+ 			Servo_Angle1(45);
+ 			Servo_Angle4(135);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=7)break;
++			if (!Action_Wait(7, request, SpeedDelay)) { return; }
++
+ 			Servo_Angle2(45);
+ 			Servo_Angle3(135);
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=7)break;
++			if (!Action_Wait(7, request, SpeedDelay)) { return; }
++
+ 			Servo_Angle1(90);
+-			Servo_Angle4(90);	
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=7)break;
++			Servo_Angle4(90);
++			if (!Action_Wait(7, request, SpeedDelay)) { return; }
++
+ 			Servo_Angle2(90);
+-			Servo_Angle3(90);	
+-			Delay_ms(SpeedDelay);
+-			if(Action_Mode!=7)break;
+-			
+-			PAnumbers--;
++			Servo_Angle3(90);
++			if (!Action_Wait(7, request, SpeedDelay)) { return; }
++
++
++			if (PAnumbers > 0) { PAnumbers--; }
+ 		}
+ 		if(Sustainedmove!=1 && Action_Mode==7)
+ 		Action_Mode=2;
+@@ -258,6 +300,8 @@
+ 
+ void Action_Swing(void)//摇摆
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(8, request, 0)) { return; }
+ 	while(Action_Mode==8)
+ 	{
+ 		for(uint8_t i=30;i<150;i++)
+@@ -266,8 +310,8 @@
+ 			Servo_Angle2(i);
+ 			Servo_Angle3(i);
+ 			Servo_Angle4(i);
+-			Delay_ms(SwingDelay);
+-			if(Action_Mode!=8)break;
++			if (!Action_Wait(8, request, SwingDelay)) { return; }
++
+ 		}
+ 		for(uint8_t i=150;i>30;i--)
+ 		{
+@@ -275,48 +319,52 @@
+ 			Servo_Angle2(i);
+ 			Servo_Angle3(i);
+ 			Servo_Angle4(i);
+-			Delay_ms(SwingDelay);
+-			if(Action_Mode!=8)break;
+-		}
+-		if(Action_Mode!=8)break;
++			if (!Action_Wait(8, request, SwingDelay)) { return; }
++
++		}
++
+ 	}
+ }
+ 
+ 
+ void Action_SwingTail(void)//摇尾巴
+ {
+-	Delay_ms(60);
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(9, request, 0)) { return; }
++	if (!Action_Wait(9, request, 60)) { return; }
+ 	while(Action_Mode==9)
+ 	{
+ 		for(uint8_t i=30;i<150;i++)
+ 		{
+ 			WServo_Angle(i);
+-			Delay_ms(SwingDelay);
+-			if(Action_Mode!=9)break;
++			if (!Action_Wait(9, request, SwingDelay)) { return; }
++
+ 		}
+ 		for(uint8_t i=150;i>30;i--)
+ 		{
+ 			WServo_Angle(i);
+-			Delay_ms(SwingDelay);
+-			if(Action_Mode!=9)break;
+-		}
+-		if(Action_Mode!=9)break;
+-	}
+-	Delay_ms(100);
++			if (!Action_Wait(9, request, SwingDelay)) { return; }
++
++		}
++
++	}
++	if (!Action_Wait(9, request, 100)) { return; }
+ }
+ 
+ void Action_JumpU(void)//向前跳
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(10, request, 0)) { return; }
+ 	if(TiaoTurn==0)
+ 	{
+ 		Servo_Angle1(140);
+ 		Servo_Angle4(35);
+-		Delay_ms(SpeedDelay);
+-		
++		if (!Action_Wait(10, request, SpeedDelay)) { return; }
++
+ 		Servo_Angle2(140);
+ 		Servo_Angle3(35);
+-		Delay_ms(SpeedDelay+80);
+-		
++		if (!Action_Wait(10, request, SpeedDelay+80)) { return; }
++
+ 		Action_Mode=2;
+ 		TiaoTurn=1;
+ 	}
+@@ -324,12 +372,12 @@
+ 	{
+ 		Servo_Angle2(140);
+ 		Servo_Angle3(35);
+-		Delay_ms(SpeedDelay);
+-		
++		if (!Action_Wait(10, request, SpeedDelay)) { return; }
++
+ 		Servo_Angle1(140);
+ 		Servo_Angle4(35);
+-		Delay_ms(SpeedDelay+80);
+-		
++		if (!Action_Wait(10, request, SpeedDelay+80)) { return; }
++
+ 		Action_Mode=2;
+ 		TiaoTurn=0;
+ 	}
+@@ -337,15 +385,17 @@
+ 
+ void Action_JumpD(void)//向后跳
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(11, request, 0)) { return; }
+ 	if(TiaoTurn2==0){
+ 		Servo_Angle4(35);
+ 		Servo_Angle1(140);
+-		Delay_ms(SpeedDelay);
+-	
++		if (!Action_Wait(11, request, SpeedDelay)) { return; }
++
+ 		Servo_Angle3(35);
+ 		Servo_Angle2(140);
+-		Delay_ms(SpeedDelay);
+-	
++		if (!Action_Wait(11, request, SpeedDelay)) { return; }
++
+ 		Action_Mode=12;
+ 		TiaoTurn2=1;
+ 	}
+@@ -353,12 +403,12 @@
+ 	{
+ 		Servo_Angle3(35);
+ 		Servo_Angle2(140);
+-		Delay_ms(SpeedDelay);
+-	
++		if (!Action_Wait(11, request, SpeedDelay)) { return; }
++
+ 		Servo_Angle4(35);
+ 		Servo_Angle1(140);
+-		Delay_ms(SpeedDelay);
+-	
++		if (!Action_Wait(11, request, SpeedDelay)) { return; }
++
+ 		Action_Mode=12;
+ 		TiaoTurn2=0;
+ 	}
+@@ -366,62 +416,66 @@
+ 
+ void Action_Hello(void)
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(13, request, 0)) { return; }
+ 	Servo_Angle3(20);
+ 	Servo_Angle4(45);
+-	Delay_ms(80);
++	if (!Action_Wait(13, request, 80)) { return; }
+ 	Servo_Angle1(90);
+ 	while(Action_Mode==13)
+ 	{
+-		if(Action_Mode!=13)break;
++
+ 		for(int i=0;i<=45;i++)
+ 		{
+-			if(Action_Mode!=13)break;
++
+ 			Servo_Angle2(i);
+-			Delay_ms(SwingDelay);
++			if (!Action_Wait(13, request, SwingDelay)) { return; }
+ 		}
+ 		for(int i=45;i>0;i--)
+ 		{
+-			if(Action_Mode!=13)break;
++
+ 			Servo_Angle2(i);
+-			Delay_ms(SwingDelay);
+-		}
+-		if(Action_Mode!=13)break;
++			if (!Action_Wait(13, request, SwingDelay)) { return; }
++		}
++
+ 	}
+ }
+ 
+ void Action_stretch(void)//伸懒腰
+ {
++	uint32_t request = Action_RequestId;
++	if (!Action_Wait(14, request, 0)) { return; }
+ 	Servo_Angle3(90);
+ 	Servo_Angle4(90);
+-	Delay_ms(80);
++	if (!Action_Wait(14, request, 80)) { return; }
+ 	for(int i=90;i>10;i--)
+ 	{
+ 		Servo_Angle1(i);
+ 		Servo_Angle2(i);
+-		if(Action_Mode!=14)break;
+-		Delay_ms(15);
++
++		if (!Action_Wait(14, request, 15)) { return; }
+ 	}
+ 	for(int i=10;i<90;i++)
+ 	{
+ 		Servo_Angle1(i);
+ 		Servo_Angle2(i);
+-		if(Action_Mode!=14)break;
+-		Delay_ms(15);
++
++		if (!Action_Wait(14, request, 15)) { return; }
+ 	}
+ 	for(int i=90;i<170;i++)
+ 	{
+ 		Servo_Angle3(i);
+ 		Servo_Angle4(i);
+-		if(Action_Mode!=14)break;
+-		Delay_ms(15);
+-	}
+-	
++
++		if (!Action_Wait(14, request, 15)) { return; }
++	}
++
+ 	for(int i=170;i>90;i--)
+ 	{
+ 		Servo_Angle3(i);
+ 		Servo_Angle4(i);
+-		if(Action_Mode!=14)break;
+-		Delay_ms(15);
++
++		if (!Action_Wait(14, request, 15)) { return; }
+ 	}
+ 	if(Action_Mode==14)
+ 	Action_Mode=15;
+@@ -429,68 +483,141 @@
+ 
+ void Action_Lstretch(void)//后腿拉伸
+ {
++	uint32_t request = Action_RequestId;
+ 	int breakvalue=1;
+ 	int temp=3;
++	if (!Action_Wait(15, request, 0)) { return; }
+ 	while(breakvalue)
+ 	{
+ 		Servo_Angle1(90);
+ 		Servo_Angle2(20);
+-		Delay_ms(60);
++		if (!Action_Wait(15, request, 60)) { return; }
+ 		Servo_Angle4(110);
+ 		for(int i=90;i<180;i++)
+ 		{
+-			if(Action_Mode!=15)break;
++
+ 			Servo_Angle3(i);
+-			Delay_ms(6);
++			if (!Action_Wait(15, request, 6)) { return; }
+ 		}
+ 		while(temp && Action_Mode==15)
+ 		{
+ 			for(int i=180;i>150;i--)
+ 			{
+-				if(Action_Mode!=15)break;
++
+ 				Servo_Angle3(i);
+-				Delay_ms(15);
++				if (!Action_Wait(15, request, 15)) { return; }
+ 			}
+ 			temp--;
+ 		}
+-		if(Action_Mode!=15)break;
+-		Delay_ms(100);
++
++		if (!Action_Wait(15, request, 100)) { return; }
+ 		Servo_Angle1(90);
+ 		Servo_Angle2(90);
+-		if(Action_Mode!=15)break;
+-		Delay_ms(80);
++
++		if (!Action_Wait(15, request, 80)) { return; }
+ 		Servo_Angle3(90);
+ 		Servo_Angle4(90);
+-		Delay_ms(100);
+-		if(Action_Mode!=15)break;
+-		
++		if (!Action_Wait(15, request, 100)) { return; }
++
++
+ 		temp=3;
+-		
++
+ 		Servo_Angle2(90);
+ 		Servo_Angle1(20);
+-		if(Action_Mode!=15)break;
+-		Delay_ms(60);
++
++		if (!Action_Wait(15, request, 60)) { return; }
+ 		Servo_Angle3(110);
+ 		for(int i=90;i<180;i++)
+ 		{
+-			if(Action_Mode!=15)break;
++
+ 			Servo_Angle4(i);
+-			Delay_ms(6);
++			if (!Action_Wait(15, request, 6)) { return; }
+ 		}
+ 		while(temp && Action_Mode==15)
+ 		{
+ 			for(int i=180;i>150;i--)
+ 			{
+-				if(Action_Mode!=15)break;
++
+ 				Servo_Angle4(i);
+-				Delay_ms(15);
++				if (!Action_Wait(15, request, 15)) { return; }
+ 			}
+ 			temp--;
+ 		}
+ 		if(Action_Mode==15)
+ 		Action_Mode=2;
+-		
+-		
++
++
+ 		breakvalue=0;
+ 	}
+ }
++
++/* Move from the last commanded pose in 20 ms frames, matching the servo PWM
++ * period. This preserves continuity when a repeated request restarts the move.
++ */
++static uint8_t Affection_Pose(uint32_t request, const float target[5], uint16_t frames)
++{
++    float start[5];
++    float progress;
++    uint16_t frame;
++    uint8_t leg;
++    if (!Action_Wait(ACTION_MODE_AFFECTION, request, 0)) { return 0; }
++    for (leg = 0; leg < 4; leg++) { start[leg] = Servo_GetAngle(leg + 1); }
++    start[4] = WServo_GetAngle();
++    for (frame = 1; frame <= frames; frame++) {
++        progress = (float)frame / frames;
++        Servo_Angle1(start[0] + (target[0] - start[0]) * progress);
++        Servo_Angle2(start[1] + (target[1] - start[1]) * progress);
++        Servo_Angle3(start[2] + (target[2] - start[2]) * progress);
++        Servo_Angle4(start[3] + (target[3] - start[3]) * progress);
++        WServo_Angle(start[4] + (target[4] - start[4]) * progress);
++        if (!Action_Wait(ACTION_MODE_AFFECTION, request, 20)) { return 0; }
++    }
++    return 1;
++}
++
++static uint8_t Affection_Tail(uint32_t request, float target, uint16_t frames)
++{
++    float start;
++    uint16_t frame;
++    if (!Action_Wait(ACTION_MODE_AFFECTION, request, 0)) { return 0; }
++    start = WServo_GetAngle();
++    for (frame = 1; frame <= frames; frame++) {
++        WServo_Angle(start + (target - start) * (float)frame / frames);
++        if (!Action_Wait(ACTION_MODE_AFFECTION, request, 20)) { return 0; }
++    }
++    return 1;
++}
++
++/* Ask for a pat: crouch, lean left/right, wag three times, then stand.
++ * Nominal duration: 4200 ms plus foreground/interrupt overhead.
++ * WeiBa is never overwritten: the user's previous tail-enable state survives.
++ */
++void Action_Affection(void)
++{
++    static const float crouch[5] = {70, 70, 70, 70, 90};
++    static const float left[5] = {65, 85, 65, 85, 90};
++    static const float right[5] = {85, 65, 85, 65, 90};
++    static const float stand[5] = {90, 90, 90, 90, 90};
++    uint32_t request = Action_RequestId;
++    uint8_t cycle;
++    if (!Action_Wait(ACTION_MODE_AFFECTION, request, 0)) { return; }
++    Face_Mode = 1;
++    if (!Affection_Pose(request, crouch, 20)) { return; }
++    if (!Action_Wait(ACTION_MODE_AFFECTION, request, 300)) { return; }
++    if (!Affection_Pose(request, left, 20)) { return; }
++    if (!Action_Wait(ACTION_MODE_AFFECTION, request, 150)) { return; }
++    if (!Affection_Pose(request, right, 30)) { return; }
++    if (!Action_Wait(ACTION_MODE_AFFECTION, request, 150)) { return; }
++    if (!Affection_Pose(request, crouch, 20)) { return; }
++    Face_Mode = 2;
++    if (!Affection_Tail(request, 75, 5)) { return; }
++    for (cycle = 0; cycle < 3; cycle++) {
++        if (!Affection_Tail(request, 105, 10)) { return; }
++        if (!Affection_Tail(request, 75, 10)) { return; }
++    }
++    if (!Affection_Tail(request, 90, 5)) { return; }
++    if (!Affection_Pose(request, stand, 20)) { return; }
++    /* No old completion/cleanup runs after a newer request takes control. */
++    Face_Mode = 2;
++    Action_Mode = 2;
++}
+--- a/HardWare/PetAction.h
++++ b/HardWare/PetAction.h
+@@ -1,6 +1,9 @@
+ #ifndef __PET_ACTION_
+-#define __PET_ACTION
++#define __PET_ACTION_
+ 
++#define ACTION_MODE_AFFECTION 16
++
++void Action_Affection(void);
+ void Action_relaxed_getdowm(void);
+ void Action_upright(void);
+ void Action_getdowm(void);
+--- a/HardWare/Servo.c
++++ b/HardWare/Servo.c
+@@ -1,32 +1,55 @@
+ #include "stm32f10x.h"                  // Device header
+ #include "PWM.h"
++#include "Servo.h"
+ 
+-void Servo_Init()
++/* Power-on reference only; there is no position feedback. */
++static float LastLegAngle[4] = {90, 90, 90, 90};
++static float LastTailAngle = 90;
++
++void Servo_Init(void)
+ {
+-	PWM_Init();	
++	uint8_t leg;
++	for (leg = 0; leg < 4; leg++) { LastLegAngle[leg] = 90; }
++	LastTailAngle = 90;
++	PWM_Init();
+ }
+ 
+ void Servo_Angle1(float Angle)//左上
+ {
+-	PWM_SetCompare1(Angle / 180 * 2000 + 500);			
++	LastLegAngle[0] = Angle;
++	PWM_SetCompare1(Angle / 180 * 2000 + 500);
+ }
+ 
+ void Servo_Angle2(float Angle)//右上
+ {
+-	PWM_SetCompare2((180-Angle) / 180 * 2000 + 500);		
++	LastLegAngle[1] = Angle;
++	PWM_SetCompare2((180-Angle) / 180 * 2000 + 500);
+ }
+ 
+ void Servo_Angle3(float Angle)//左下
+ {
+-	PWM_SetCompare3(Angle / 180 * 2000 + 500);			
++	LastLegAngle[2] = Angle;
++	PWM_SetCompare3(Angle / 180 * 2000 + 500);
+ }
+ 
+ void Servo_Angle4(float Angle)//右下
+ {
+-	PWM_SetCompare4((180-Angle) / 180 * 2000 + 500);			
++	LastLegAngle[3] = Angle;
++	PWM_SetCompare4((180-Angle) / 180 * 2000 + 500);
+ }
+ 
+ void WServo_Angle(float Angle)//尾巴
+ {
+-	PWM_WSetCompare(Angle / 180 * 2000 + 500);			
++	LastTailAngle = Angle;
++	PWM_WSetCompare(Angle / 180 * 2000 + 500);
+ }
++
++float Servo_GetAngle(uint8_t leg)
++{
++    return (leg >= 1 && leg <= 4) ? LastLegAngle[leg - 1] : 90;
++}
++
++float WServo_GetAngle(void)
++{
++    return LastTailAngle;
++}
+--- a/HardWare/Servo.h
++++ b/HardWare/Servo.h
+@@ -1,5 +1,7 @@
+ #ifndef __SERVO_H
+ #define __SERVO_H
++
++#include <stdint.h>
+ 
+ void Servo_Init(void);
+ void Servo_Angle1(float Angle);
+@@ -8,5 +10,9 @@
+ void Servo_Angle4(float Angle);
+ void WServo_Angle(float Angle);
+ 
++/* Last commanded angles, not measured mechanical positions. Legs are 1..4. */
++float Servo_GetAngle(uint8_t leg);
++float WServo_GetAngle(void);
++
+ #endif
+ 
+--- a/User/main.c
++++ b/User/main.c
+@@ -11,10 +11,10 @@
+ /***************************************************************************************
+   * 本程序由博主我Sngels_wyh创建并免费开源共享
+   * 你可以任意查看、使用和修改，并应用到自己的项目之中
+-  * 
++  *
+   * 程序名称：				基于STM32F103C8T6单片机的桌面宠物小项目
+   * 此程序更新时间：			2024.2.16
+-  * 
++  *
+   * 主要在立创开源平台、CSDN网站、哔哩哔哩、抖音分享自己的作品。
+ 	*	相关的资料可以去立创开源硬件平台网站上搜索,作品附件放置更新网盘，如有更新可方便快速查看
+ 	* 地址:https://oshwhub.com/sngelswyh/stm32-smart-desktop-pet
+@@ -28,14 +28,15 @@
+ 
+ int main(void)
+ {
++	NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+ 	Servo_Init();
+ 	OLED_Init();//OLED初始化
+ 	BlueTooth_Init();//蓝牙初始化
+-	OLED_ShowImage(0,0,128,64,Face_sleep);
+-	OLED_Update();
++	BlueTooth_Process();
+ 	while(1)
+-	{	
+-		if(Action_Mode==0){Action_relaxed_getdowm();WServo_Angle(90);}//放松趴下
++	{
++		BlueTooth_Process();
++		if(Action_Mode==0){Action_relaxed_getdowm();}//放松趴下
+ 		else if(Action_Mode==1){Action_sit();}//坐下
+ 		else if(Action_Mode==2){Action_upright();}//站立
+ 		else if(Action_Mode==3){Action_getdowm();}//趴下
+@@ -51,6 +52,7 @@
+ 		else if(Action_Mode==13){Action_Hello();}//打招呼
+ 		else if(Action_Mode==14){Action_stretch();}//伸懒腰
+ 		else if(Action_Mode==15){Action_Lstretch();}//后腿拉伸
++		else if(Action_Mode==ACTION_MODE_AFFECTION){Action_Affection();}
+ 	}
+ }
+ 
+@@ -58,7 +60,7 @@
+ void TIM3_IRQHandler(void)
+ {
+ 	if(TIM_GetITStatus(TIM3,TIM_IT_Update)==SET)
+-	{	
++	{
+ 		if(AllLed==1 && BreatheLed==0)//如果灯光开启且不开启呼吸灯,亮度拉满
+ 		{
+ 			PWM_LED1(20000);
+@@ -99,7 +101,7 @@
+ 			PWM_LED1(0);
+ 			PWM_LED2(0);
+ 		}
+-		
++
+ 		TIM_ClearITPendingBit(TIM3,TIM_IT_Update);
+ 	}
+ }
